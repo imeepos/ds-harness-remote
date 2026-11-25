@@ -15,7 +15,19 @@ const tokenSchema = z.object({
   recovery: z.object({ nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/), accessExpires: z.number().int().positive() }).optional(),
 })
 const savedDeviceSchema = z.object({ descriptor: accountDeviceDescriptorSchema, revoked: z.boolean(), lastSeenAt: z.number() })
-const stateSchema = z.object({ version: z.literal(1), account: z.string(), salt: z.string(), verifier: z.string(), devices: z.record(z.string(), savedDeviceSchema), tokens: z.record(z.string(), tokenSchema) })
+const stateSchema = z.object({
+  version: z.literal(1),
+  account: z.string(),
+  salt: z.string(),
+  verifier: z.string(),
+  devices: z.record(z.string(), savedDeviceSchema),
+  tokens: z.record(z.string(), tokenSchema),
+  /**
+   * 已登记的回执签名公钥（deviceId → 32 字节 Ed25519 公钥 base64url）。
+   * 与设备 descriptor 分开存放：descriptor 的 schema 由协议固定，不能加字段。
+   */
+  receiptKeys: z.record(z.string(), z.string()).optional(),
+})
 type SavedDevice = z.infer<typeof savedDeviceSchema>
 type SavedToken = z.infer<typeof tokenSchema>
 
@@ -36,6 +48,7 @@ export class Store {
     const salt = previous?.salt ?? secret()
     const verifier = scryptSync(password, salt, 32).toString('hex')
     this.state = previous ?? { version: 1, account, salt, verifier, devices: {}, tokens: {} }
+    this.state.receiptKeys ??= {}
     if (this.state.account !== account) this.state.devices = {}
     if (this.state.account !== account || !equal(this.state.verifier, verifier)) this.state.tokens = {}
     Object.assign(this.state, { account, verifier })
@@ -116,6 +129,18 @@ export class Store {
     for (const [key, value] of Object.entries(this.state.tokens)) if (value.deviceId === deviceId) delete this.state.tokens[key]
     this.onInvalidate(deviceId)
     this.save()
+  }
+  /**
+   * 登记回执签名公钥。一旦登记，该设备提交的签名回执必须用同一把钥匙——
+   * 换钥需要重新登记，历史回执的验签结果不受影响（公钥仍在回执里）。
+   */
+  setReceiptKey(deviceId: string, key: string): void {
+    this.get(deviceId)
+    this.state.receiptKeys![deviceId] = key
+    this.save()
+  }
+  receiptKey(deviceId: string): string | undefined {
+    return this.state.receiptKeys?.[deviceId]
   }
   revoke(id: string): void { this.get(id).revoked = true; this.invalidate(id) }
   rename(id: string, name: string): void {

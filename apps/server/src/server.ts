@@ -1,13 +1,14 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createPublicKey, verify as verifySignature } from 'node:crypto'
 import { isIP } from 'node:net'
 import { z } from 'zod'
 import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema, parseWireJson } from '@dsh-remote/protocol'
 import { ApiError, Store, equal, hash, secret } from './store.js'
 import { Gateway } from './gateway.js'
+import { GRANTS_CAPABILITY, GrantStore, grantRequestSchema } from './grants.js'
 import { buildIceServers, parseIceConfig, type IceConfig } from './ice.js'
 import { Logger, type LogLevel } from './logger.js'
 import {
@@ -28,6 +29,8 @@ export interface Config {
   account: string
   password: string
   dataFile: string
+  /** 授权存储文件；默认与 dataFile 同目录的 grants.json。 */
+  grantsFile?: string
   publicUrl: string
   trustedProxyIps?: readonly string[]
   helloTimeoutMs?: number
@@ -36,6 +39,8 @@ export interface Config {
   forceTerminateGraceMs?: number
   maxFramesPerSec?: number
   logLevel?: LogLevel
+  /** P4 时钟端口：只用于租约到期判定，测试可注入。 */
+  now?: () => number
   ice?: IceConfig
 }
 
@@ -81,6 +86,40 @@ export {
 export type { GatewayTimingOptions, NormalizedGatewayOptions } from './config.js'
 
 const loginSchema = z.object({ email: z.string().min(1).max(254), password: z.string().min(1).max(1024) }).strict()
+const receiptKeySchema = z.object({ v: z.literal(1), receiptSigningKey: z.string().regex(/^[A-Za-z0-9_-]{43}$/u) }).strict()
+
+/** Ed25519 SPKI DER 前缀：30 2a 30 05 06 03 2b 65 70 03 21 00 + 32 字节原始公钥。 */
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
+
+/** 与 contract/verify-receipt.mjs、plugin/src/receipt-signer.ts 完全一致的规范输入。 */
+function receiptSigningInput(receipt: { connectionId: string; grantId: string; clientDeviceId: string; hostDeviceId: string; startedAt: number; endedAt: number; counters: { frames: number; bytes: number } }): string {
+  return JSON.stringify([receipt.connectionId, receipt.grantId, receipt.clientDeviceId, receipt.hostDeviceId,
+    receipt.startedAt, receipt.endedAt, receipt.counters.frames, receipt.counters.bytes])
+}
+
+function verifyReceiptSignature(receipt: { connectionId: string; grantId: string; clientDeviceId: string; hostDeviceId: string; startedAt: number; endedAt: number; counters: { frames: number; bytes: number } }, signer: string, sig: string): boolean {
+  try {
+    const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(signer, 'base64url')]), format: 'der', type: 'spki' })
+    return verifySignature(null, Buffer.from(receiptSigningInput(receipt), 'utf8'), key, Buffer.from(sig, 'base64url'))
+  } catch {
+    return false
+  }
+}
+/** Host 侧签名回执：内容必须与 Server 见证逐项一致，签名原样保存。 */
+const signedReceiptSchema = z.object({
+  v: z.literal(1),
+  receipt: z.object({
+    connectionId: z.string().min(1).max(128),
+    grantId: z.string().min(1).max(128),
+    clientDeviceId: z.string().min(1).max(128),
+    hostDeviceId: z.string().min(1).max(128),
+    startedAt: z.number().int().nonnegative(),
+    endedAt: z.number().int().nonnegative(),
+    counters: z.object({ frames: z.number().int().nonnegative(), bytes: z.number().int().nonnegative() }).strict(),
+    signer: z.string().regex(/^[A-Za-z0-9_-]{43}$/u),
+    sig: z.string().regex(/^[A-Za-z0-9_-]{86}$/u),
+  }).strict(),
+}).strict()
 const publicDir = fileURLToPath(new URL('../dist/public/', import.meta.url))
 function readAssets(): Map<string, Buffer> {
   if (!existsSync(publicDir)) return new Map()
@@ -167,6 +206,19 @@ export function createRemoteServer(config: Config) {
   const trustedProxyIps = normalizeTrustedProxyIps(config.trustedProxyIps)
   const ice = config.ice ?? parseIceConfig({})
   const store = new Store(config.dataFile, config.account.trim(), config.password)
+  const grants = new GrantStore(
+    config.grantsFile ?? join(dirname(config.dataFile), 'grants.json'),
+    store.account,
+    config.now === undefined ? {} : { now: config.now },
+  )
+  // 回执：Server 只能为它亲手搬运过的连接作证（帧数/字节数/时段），不含任何明文。
+  // 保留最近 256 条；落盘留待有审计需求时再做，避免把热路径变成写放大。
+  const receipts: Array<import('./gateway.js').LeaseReceipt & { grantDigest?: string; attestedBy: 'server' }> = []
+  const recordReceipt = (receipt: import('./gateway.js').LeaseReceipt): void => {
+    const grant = grants.get(receipt.grantId)
+    receipts.unshift({ ...receipt, ...(grant === undefined ? {} : { grantDigest: grants.digest(grant) }), attestedBy: 'server' })
+    if (receipts.length > 256) receipts.pop()
+  }
   const assets = readAssets()
   const sessions = new Map<string, number>()
   const limits = new Map<string, { count: number; until: number }>()
@@ -218,6 +270,9 @@ export function createRemoteServer(config: Config) {
     logLevel: config.logLevel,
     logger: logger.child('gateway'),
     turnEnabled: ice.turnUrls.length > 0,
+    grants,
+    onReceipt: recordReceipt,
+    ...(config.now === undefined ? {} : { now: config.now }),
   })
   function descriptor(d: ReturnType<Store['get']>) {
     return { ...d.descriptor, membershipId: `account:${hash(store.account).slice(0, 16)}`, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }
@@ -273,6 +328,66 @@ export function createRemoteServer(config: Config) {
       const data = deviceRefreshRequestSchema.parse(await body(req))
       json(res, 200, store.refresh(data.deviceId, data.refreshToken)); return
     }
+    // 授权是目录记录：三个端点骑在既有动词上（directory.write / directory.read / revoke），
+    // 不新增动词、不新增内部码。
+    if (method === 'POST' && path === '/api/v1/grants') {
+      accountAuth(req)
+      const parsed = grantRequestSchema.parse(await body(req))
+      for (const ref of [parsed.grant.subject, parsed.grant.resource]) {
+        if (ref !== '*') store.get(ref)
+      }
+      const host = parsed.grant.resource === '*' ? undefined : gateway.peers.get(parsed.grant.resource)
+      const executionScopesAllowed = host !== undefined && host.capabilities.includes(GRANTS_CAPABILITY)
+      json(res, 200, grants.issue(parsed, { executionScopesAllowed })); return
+    }
+    if (method === 'GET' && path === '/api/v1/grants') {
+      accountAuth(req)
+      json(res, 200, { items: grants.list() }); return
+    }
+    if (method === 'GET' && path === '/api/v1/receipts') {
+      accountAuth(req)
+      json(res, 200, { items: receipts }); return
+    }
+    // Host 登记回执签名公钥：登记后它提交的签名回执必须用同一把钥匙。
+    if (method === 'POST' && path === '/api/v1/devices/self/receipt-key') {
+      const source = deviceAuth(req)
+      if (source.descriptor.role !== 'host') throw new ApiError('MEMBERSHIP_REQUIRED', 403)
+      const parsed = receiptKeySchema.parse(await body(req))
+      store.setReceiptKey(source.descriptor.deviceId, parsed.receiptSigningKey)
+      json(res, 200, { status: 'registered', receiptSigningKey: parsed.receiptSigningKey }); return
+    }
+    // Host 在会话结束时提交自己签名的回执。只接受"该 Host 确实有一条 Server 见证的回执"的连接，
+    // 避免伪造任意 connectionId；签名原样保存，由 contract/verify-receipt.mjs 校验。
+    if (method === 'POST' && path === '/api/v1/receipts') {
+      const source = deviceAuth(req)
+      if (source.descriptor.role !== 'host') throw new ApiError('MEMBERSHIP_REQUIRED', 403)
+      const signed = signedReceiptSchema.parse(await body(req))
+      const witness = receipts.find((item) => item.connectionId === signed.receipt.connectionId && item.hostDeviceId === source.descriptor.deviceId)
+      if (witness === undefined) throw new ApiError('CONNECTION_NOT_FOUND', 404)
+      // 只校验"同一会话、同一委托、同一对端"；计数允许不同——Server 数它搬运的帧，
+      // Host 数它自己通道上的帧，两份见证各自独立，互不覆盖。
+      if (signed.receipt.clientDeviceId !== witness.clientDeviceId || signed.receipt.grantId !== witness.grantId) {
+        throw new ApiError('INVALID_MESSAGE')
+      }
+      // 公钥必须已登记且与回执一致：这是"第三方可验"的信任锚，不登记就等于自签。
+      const registered = store.receiptKey(source.descriptor.deviceId)
+      if (registered === undefined || registered !== signed.receipt.signer) throw new ApiError('AUTH_INVALID', 401)
+      if (!verifyReceiptSignature(signed.receipt, signed.receipt.signer, signed.receipt.sig)) throw new ApiError('INVALID_MESSAGE')
+      Object.assign(witness, {
+        attestedBy: 'host+server',
+        signer: signed.receipt.signer,
+        sig: signed.receipt.sig,
+        hostCounters: signed.receipt.counters,
+      })
+      json(res, 200, witness); return
+    }
+    const grantMatch = /^\/api\/v1\/grants\/([^/]+)$/.exec(path)
+    if (method === 'DELETE' && grantMatch) {
+      accountAuth(req)
+      const grant = grants.revoke(grantMatch[1]!)
+      gateway.revokeGrant(grant.id)
+      json(res, 200, { status: 'revoked', grant }); return
+    }
     if (method === 'DELETE' && path === '/api/v1/devices/self') {
       store.revoke(deviceAuth(req).descriptor.deviceId); json(res, 200, { status: 'revoked' }); return
     }
@@ -305,11 +420,25 @@ export function createRemoteServer(config: Config) {
       const source = deviceAuth(req), target = store.get(match[1]!)
       if (source.descriptor.role === target.descriptor.role) throw new ApiError('MEMBERSHIP_REQUIRED', 403)
       const d = descriptor(target)
-      json(res, 200, match[2] ? { deviceId: d.deviceId, online: d.online, lastSeenAt: d.lastSeenAt } : d); return
+      if (match[2]) { json(res, 200, { deviceId: d.deviceId, online: d.online, lastSeenAt: d.lastSeenAt }); return }
+      // Host 拉取 Client descriptor 时一并拿到覆盖这条关系的委托：执行级收窄由 Host 落地，
+      // Server 判不了明文，只能把范围交给对端。旧 Host 忽略未知字段。
+      const peerGrants = source.descriptor.role === 'host'
+        ? grants.list()
+            .filter((grant) => grant.state === 'active' && grant.expiresAt > Date.now()
+              && (grant.subject === '*' || grant.subject === target.descriptor.deviceId)
+              && (grant.resource === '*' || grant.resource === source.descriptor.deviceId))
+            .map((grant) => ({ id: grant.id, expiresAt: grant.expiresAt, ...(grant.executionScopes === undefined ? {} : { executionScopes: grant.executionScopes }) }))
+        : []
+      json(res, 200, {
+        ...d,
+        ...(store.receiptKey(target.descriptor.deviceId) === undefined ? {} : { receiptSigningKey: store.receiptKey(target.descriptor.deviceId) }),
+        ...(peerGrants.length === 0 ? {} : { grants: peerGrants }),
+      }); return
     }
     throw new ApiError('METHOD_NOT_FOUND', 404)
   }
-  return { server, store, gateway, logger, close: async () => { gateway.close(); server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) } }
+  return { server, store, grants, receipts, gateway, logger, close: async () => { gateway.close(); server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) } }
 }
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value))

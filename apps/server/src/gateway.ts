@@ -16,6 +16,8 @@ import {
   type TransportSelectedPayload,
 } from '@dsh-remote/protocol'
 import { ApiError, Store } from './store.js'
+import { GRANTS_CAPABILITY, type GrantLookup } from './grants.js'
+import { LeaseRegistry, type LeaseEnd } from './leases.js'
 import { Logger, type LogLevel } from './logger.js'
 import { normalizeGatewayOptions, normalizeMaxFramesPerSec, type GatewayTimingOptions } from './config.js'
 
@@ -25,6 +27,23 @@ export interface GatewayOptions extends GatewayTimingOptions {
   logger?: Logger
   /** Advertise `transport.turn` (and accept TURN credential requests). */
   turnEnabled?: boolean
+  /** 授权存储；缺省时退化为旧的"同账号全通"行为。 */
+  grants?: GrantLookup
+  /** P4 时钟端口：租约到期判定必须可注入。 */
+  now?: () => number
+  /** 会话结束回执：只含连接、委托引用与计数，不含任何明文。 */
+  onReceipt?: (receipt: LeaseReceipt) => void
+}
+
+/** 一条逻辑会话的结束回执（server-attested：Server 只能为它亲眼搬运过的东西作证）。 */
+export interface LeaseReceipt {
+  connectionId: string
+  grantId: string
+  clientDeviceId: string
+  hostDeviceId: string
+  startedAt: number
+  endedAt: number
+  counters: { frames: number; bytes: number }
 }
 
 /**
@@ -36,7 +55,7 @@ export interface GatewayOptions extends GatewayTimingOptions {
 type ConnectionState = 'awaiting_hello' | 'authenticated' | 'closing' | 'closed'
 
 type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; pendingNonces: string[]; evictedTombstoneUntil?: number }
-type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number }
+type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number; grantId?: string; frames?: number; bytes?: number }
 type DroppedLink = { host: string; client: string; expiresAt: number; droppedFrames: number }
 
 /** Keep tombstones long enough for late in-flight frames to drain without CONNECTION_NOT_FOUND storms. */
@@ -121,6 +140,11 @@ export class Gateway {
   readonly forceTerminateGraceMs: number
   readonly maxFramesPerSec: number
   readonly logger: Logger
+  private readonly grants: GrantLookup | undefined
+  private readonly leases: LeaseRegistry
+  private readonly now: () => number
+  private readonly onReceipt: ((receipt: LeaseReceipt) => void) | undefined
+  private leaseSweep: ReturnType<typeof setInterval> | undefined
 
   constructor(server: Server, private store: Store, origin: string, options: GatewayOptions = {}) {
     // One normalization path for CLI and programmatic callers: NaN, Infinity,
@@ -134,6 +158,20 @@ export class Gateway {
     this.maxFramesPerSec = normalizeMaxFramesPerSec(options.maxFramesPerSec)
     this.logger = options.logger ?? new Logger('gateway', options.logLevel ?? 'info')
     this.turnEnabled = options.turnEnabled === true
+    this.grants = options.grants
+    this.now = options.now ?? Date.now
+    this.onReceipt = options.onReceipt
+    this.leases = new LeaseRegistry(this.now)
+    // 撤销走事件（立即），到期走时钟（≤1s）。两条路共用 endLease 一个出口。
+    this.leaseSweep = setInterval(() => {
+      if (this.closed) return
+      for (const lease of this.leases.expired(this.now())) {
+        const link = this.links.get(lease.connectionId)
+        if (link !== undefined) this.drop(link, 'AUTH_INVALID')
+        else this.endLease(lease.connectionId, 'AUTH_INVALID')
+      }
+    }, 1000)
+    this.leaseSweep.unref()
     const publicUrl = new URL(origin)
     const portlessOrigin = publicUrl.port === '' ? undefined : `${publicUrl.protocol}//${publicUrl.hostname}`
 
@@ -272,8 +310,36 @@ export class Gateway {
     if (peer.ws.bufferedAmount > 4 * MAX_RELAY_FRAME_BYTES) { this.disconnect(peer.id, 'SLOW_CONSUMER'); return }
     peer.ws.send(JSON.stringify(frame))
   }
+  /** 拒绝一次请求而不拆控制通道：只发 error 帧，connectionId 缺省表示请求级。 */
+  private deny(peer: Peer, code: string, message: string): void {
+    this.send(peer, createControlFrame('error', { code, message, retryable: false }))
+  }
+  /** 租约的唯一出口：所有断链路径都必须经过这里，撤销、到期、替换、超时都一样。 */
+  private endLease(connectionId: string, reason: string, counters?: { frames: number; bytes: number }): LeaseEnd | undefined {
+    const ended = this.leases.end(connectionId, reason)
+    if (ended === undefined) return undefined
+    const endedAt = this.now()
+    this.logger.info('lease_ended', {
+      connectionId: safeText(connectionId),
+      grantId: safeText(ended.lease.grantId),
+      reason: safeText(reason),
+      elapsedMs: endedAt - ended.lease.startedAt,
+    })
+    this.onReceipt?.({
+      connectionId,
+      grantId: ended.lease.grantId,
+      clientDeviceId: ended.lease.clientDeviceId,
+      hostDeviceId: ended.lease.hostDeviceId,
+      startedAt: ended.lease.startedAt,
+      endedAt,
+      counters: counters ?? { frames: 0, bytes: 0 },
+    })
+    return ended
+  }
   private drop(link: Link, code: string): void {
+    const counters = { frames: link.frames ?? 0, bytes: link.bytes ?? 0 }
     this.links.delete(link.id)
+    this.endLease(link.id, code, counters)
     this.recordDroppedLink(link)
     for (const id of [link.host, link.client]) {
       const p = this.peers.get(id)
@@ -308,14 +374,19 @@ export class Gateway {
     const link = this.links.get(connectionId)
     if (link === undefined) return false
     if (link.host !== deviceId && link.client !== deviceId) return false
+    // 生命周期：Host 尚未接受前不签发。这是阶段判定，不是路径判定。
     if (link.stage === 'pending') return false
-    if (link.stage === 'ready' && !link.preferredTransports.some(transport => transport !== 'relay')) {
-      return false
-    }
-    return this.peers.has(link.host) && this.peers.has(link.client)
+    // 能力：链路协商集里没有 WebRTC 时 TURN 不在范围内（I3 交集）。
+    // 注意这里读的是 preferredTransports（协商结果），不是 transport.selected（实际路径）——
+    // 后者才属于 I10 的禁读项。
+    if (link.stage === 'ready' && !link.preferredTransports.some((transport) => transport !== 'relay')) return false
+    // 授权：租约必须覆盖 ice.issue。
+    return this.leases.allows(connectionId, deviceId, 'ice.issue', this.now())
   }
   private supportedCapabilities(): string[] {
-    return SUPPORTED_TRANSPORTS.filter(capability => capability !== 'transport.turn' || this.turnEnabled)
+    const transports = SUPPORTED_TRANSPORTS.filter((capability) => capability !== 'transport.turn' || this.turnEnabled)
+    // grants.v1 只在真的接了授权存储时宣告：不宣告就不会有从属行为。
+    return this.grants === undefined ? [...transports] : [...transports, GRANTS_CAPABILITY]
   }
   private negotiatedCapabilities(offered: readonly string[]): string[] {
     return this.supportedCapabilities().filter(capability => offered.includes(capability))
@@ -543,6 +614,20 @@ export class Gateway {
       const host = this.peers.get(request.hostDeviceId)
       if (!host || host.role !== 'host') { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
       this.store.get(host.id)
+      // I13 的入口：连接必须由一份未被撤销、未过期、额度未尽的授权覆盖。
+      // 隐式全通授权让默认配置严格等价于旧的 membership 行为。
+      // 拒绝只作用于这次请求（error 帧 + connectionId 缺省），不拆整条控制通道：
+      // 否则一次越权尝试会连带断开该客户端已建立的其他链路。
+      const grant = this.grants?.authorize(peer.id, host.id, 'link.request')
+      if (this.grants !== undefined && grant === undefined) {
+        this.send(peer, createControlFrame('error', { code: 'MEMBERSHIP_REQUIRED', message: 'No active grant covers this host.', retryable: false }))
+        return
+      }
+      // 执行级收窄只能给协商了该能力的主机；否则拒绝建链，而不是签了当没看见。
+      if (grant?.executionScopes !== undefined && grant.executionScopes.length > 0 && !host.capabilities.includes(GRANTS_CAPABILITY)) {
+        this.send(peer, createControlFrame('error', { code: 'CAPABILITY_NOT_SUPPORTED', message: 'Host does not advertise grants.v1.', retryable: false }))
+        return
+      }
       if (!request.preferredTransports.includes('relay') || !peer.capabilities.includes('transport.relay') || !host.capabilities.includes('transport.relay')) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
       // The link coordinates only transports both peers actually advertised;
       // the Host receives the same intersection so it never sees a transport
@@ -550,8 +635,20 @@ export class Gateway {
       const preferredTransports = [...new Set(request.preferredTransports)].filter(transport =>
         peer.capabilities.includes(`transport.${transport}`) && host.capabilities.includes(`transport.${transport}`))
       if (preferredTransports.length === 0) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
+      // 授权里写了传输约束时，协商结果必须与之有交集；否则这条链路无法满足授权。
+      const allowedTransports = grant?.constraints?.transports
+      if (allowedTransports !== undefined && !preferredTransports.some((transport) => allowedTransports.includes(transport))) {
+        this.deny(peer, 'CAPABILITY_NOT_SUPPORTED', 'No negotiated transport is allowed by the grant.')
+        return
+      }
       for (const old of this.links.values()) if (old.client === peer.id || (old.host === host.id && !modernHost(host.version))) this.drop(old, 'CONNECTION_REPLACED')
       if (this.links.size >= 256) throw new ApiError('RATE_LIMITED')
+      // maxConcurrent 只约束"不同客户端共用一份授权"的情形；同一客户端的新连接已在上一步被替换。
+      const maxConcurrent = grant?.constraints?.maxConcurrent
+      if (grant !== undefined && maxConcurrent !== undefined && this.leases.countForGrant(grant.id, peer.id, this.now()) >= maxConcurrent) {
+        this.deny(peer, 'RATE_LIMITED', 'This grant has reached maxConcurrent.')
+        return
+      }
       const link: Link = {
         id: randomUUID(),
         host: host.id,
@@ -561,8 +658,26 @@ export class Gateway {
         counters: new Map(),
         preferredTransports,
         iceCandidates: 0,
+        ...(grant === undefined ? {} : { grantId: grant.id }),
+      }
+      // 消耗一次额度后才建链：额度用尽在 authorize 阶段已被拒绝，这里只兜时钟竞态。
+      if (grant !== undefined && grant.id !== 'implicit-all-pass' && this.grants?.consume !== undefined) {
+        try {
+          this.grants.consume(grant.id, this.now())
+        } catch {
+          this.deny(peer, 'RATE_LIMITED', 'This grant has no session budget left.')
+          return
+        }
       }
       this.links.set(link.id, link)
+      if (grant !== undefined) {
+        this.leases.start({
+          connectionId: link.id,
+          grant,
+          clientDeviceId: peer.id,
+          hostDeviceId: host.id,
+        })
+      }
       this.send(host, createControlFrame('connect.incoming', {
         connectionId: link.id,
         clientDeviceId: peer.id,
@@ -590,6 +705,18 @@ export class Gateway {
       return
     }
     if (p.targetDeviceId !== otherId || link.stage === 'pending') throw new ApiError('CONNECTION_NOT_FOUND')
+    // I13：连接上的每一次数据面转发都必须命中一个未过期、覆盖 frame.forward 的租约。
+    // 未命中即断链，而不是放过去让 Host 自己发现。
+    if (!this.leases.allows(link.id, peer.id, 'frame.forward', this.now())) {
+      this.drop(link, 'AUTH_INVALID')
+      return
+    }
+    // 回执计数：只数 Server 亲手搬运过的东西（帧数与密文字节），不含内容。
+    link.frames = (link.frames ?? 0) + 1
+    if (frame.type === 'relay') {
+      const ciphertext = (frame.payload as { ciphertext?: unknown }).ciphertext
+      if (typeof ciphertext === 'string') link.bytes = (link.bytes ?? 0) + ciphertext.length
+    }
     if (frame.type.startsWith('signal.')) {
       this.forwardSignal(link, peer, other, frame)
       return
@@ -659,10 +786,21 @@ export class Gateway {
       ? createControlFrame('transport.selected', { ...payload })
       : createControlFrame('transport.selected', { ...payload, transport: selected }))
   }
+  /**
+   * 撤一份授权：只断开引用它的连接，不影响同设备的其他连接（I14 的入口）。
+   *
+   * 只有一个机制：drop → endLease。早先版本还有一条 endByGrant 循环，
+   * 消融证明它不可达（断链已经结束租约），已删除——同一语义不留两条路径。
+   */
+  revokeGrant(grantId: string): void {
+    for (const link of [...this.links.values()]) if (link.grantId === grantId) this.drop(link, 'AUTH_INVALID')
+  }
+
   close(): void {
     if (this.closed) return
     this.closed = true
     clearInterval(this.heartbeat)
+    if (this.leaseSweep !== undefined) clearInterval(this.leaseSweep)
     this.logger.info('ws_gateway_closing', { clientCount: this.wss.clients.size })
     // A planned shutdown must not report each closing peer as CONNECTION_FAILED.
     this.peers.clear()
