@@ -8,7 +8,12 @@
     "start": "node dist/main.js",
     "build": "tsc -p tsconfig.json && vite build --config web/vite.config.ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "contract": "node contract/check.mjs && node contract/corpus.mjs && node contract/ablate.mjs",
+    "contract:check": "node contract/check.mjs",
+    "contract:corpus": "node contract/corpus.mjs",
+    "contract:ablate": "node contract/ablate.mjs",
+    "scenarios": "node contract/scenarios.mjs"
   },
   "dependencies": {
     "@dsh-remote/protocol": "workspace:*",

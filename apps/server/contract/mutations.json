@@ -1,0 +1,61 @@
+{
+  "registry": "DSH-R mutation registry",
+  "version": 1,
+  "meaning": "每个条目删掉一处检查，指定用例必须变红。find 必须唯一命中；replace 是删掉检查后的代码。",
+  "mutations": [
+    {
+      "id": "M1",
+      "title": "建链时不查授权",
+      "file": "src/gateway.ts",
+      "find": "const grant = this.grants?.authorize(peer.id, host.id, 'link.request')",
+      "replace": "const grant = undefined as ReturnType<NonNullable<typeof this.grants>['authorize']>",
+      "testFile": "tests/grants.test.ts",
+      "testName": "scopes link.request to an explicit grant without tearing down the control channel"
+    },
+    {
+      "id": "M2",
+      "title": "撤销不断链",
+      "file": "src/gateway.ts",
+      "find": "for (const link of [...this.links.values()]) if (link.grantId === grantId) this.drop(link, 'AUTH_INVALID')",
+      "replace": "for (const link of [...this.links.values()]) if (false && link.grantId === grantId) this.drop(link, 'AUTH_INVALID')",
+      "testFile": "tests/leases.test.ts",
+      "testName": "revocation race: revoking one grant kills only its link"
+    },
+    {
+      "id": "M3",
+      "title": "到期扫描缺失",
+      "file": "src/gateway.ts",
+      "find": "for (const lease of this.leases.expired(this.now())) {",
+      "replace": "for (const lease of []) {",
+      "testFile": "tests/leases.test.ts",
+      "testName": "expiry sweep: an idle link is closed within one sweep even without traffic"
+    },
+    {
+      "id": "M4",
+      "title": "转发时不查租约",
+      "file": "src/gateway.ts",
+      "find": "if (!this.leases.allows(link.id, peer.id, 'frame.forward', this.now())) {",
+      "replace": "if (false) {",
+      "testFile": "tests/leases.test.ts",
+      "testName": "expiry race: a frame arriving after the lease clock expires is not forwarded"
+    },
+    {
+      "id": "M5",
+      "title": "执行级范围绕过能力门禁",
+      "file": "src/grants.ts",
+      "find": "if ((grantInput.executionScopes?.length ?? 0) > 0 && options.executionScopesAllowed !== true) {",
+      "replace": "if (false) {",
+      "testFile": "tests/grants.test.ts",
+      "testName": "refuses execution scopes unless the host is online and advertises grants.v1"
+    },
+    {
+      "id": "M6",
+      "title": "额度不消耗",
+      "file": "src/grants.ts",
+      "find": "grant.sessionsUsed = (grant.sessionsUsed ?? 0) + 1",
+      "replace": "grant.sessionsUsed = grant.sessionsUsed ?? 0",
+      "testFile": "tests/leases.test.ts",
+      "testName": "budget exhaustion: sessionBudget refuses the next session"
+    }
+  ]
+}

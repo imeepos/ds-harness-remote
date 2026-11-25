@@ -1,0 +1,51 @@
+{
+  "registry": "DSH-R state machines",
+  "version": 1,
+  "meaning": "三张表。表外的转移一律 deny(LINK_STATE)。gateway.ts 中的帧类型必须全部出现在下表或 nonVerbs。",
+  "control": {
+    "states": ["awaiting_hello", "authenticated", "closing", "closed"],
+    "transitions": [
+      { "from": "awaiting_hello", "on": "hello", "to": "authenticated", "guard": "token∧deviceId∧role∧protocols" },
+      { "from": "awaiting_hello", "on": "other", "to": "closing", "guard": "AUTH_REQUIRED" },
+      { "from": "authenticated", "on": "hello", "to": "closing", "guard": "INVALID_MESSAGE" },
+      { "from": "authenticated", "on": "frame", "to": "authenticated", "guard": "handle(peer, frame)" }
+    ],
+    "timeout": { "helloTimeoutMs": 5000, "from": "awaiting_hello", "to": "closing" }
+  },
+  "link": {
+    "states": ["pending", "accepted", "handshake", "ready"],
+    "transitions": [
+      { "from": "pending", "on": "connect.accepted", "to": "accepted", "by": "host" },
+      { "from": "pending", "on": "connect.rejected", "to": null, "by": "host", "effect": "link removed" },
+      { "from": "accepted", "on": "secure.handshake", "to": "handshake", "by": "client", "step": 1 },
+      { "from": "handshake", "on": "secure.handshake", "to": "ready", "by": "host", "step": 2 },
+      { "from": "ready", "on": "relay", "to": "ready", "guard": "counter strictly increasing per peer" }
+    ],
+    "frameMatrix": {
+      "pending": [],
+      "accepted": ["secure.handshake:client:1", "signal.offer", "signal.ice", "transport.selected:client"],
+      "handshake": ["secure.handshake:host:2", "signal.ice", "transport.selected"],
+      "ready": ["relay", "transport.selected:notification"]
+    },
+    "unknownTransition": "deny(LINK_STATE)"
+  },
+  "token": {
+    "kinds": ["access", "refresh"],
+    "states": ["issued", "used", "recovered"],
+    "transitions": [
+      { "from": "issued", "on": "refresh", "to": "used+successor", "idempotent": false },
+      { "from": "used", "on": "same refresh", "to": "same successor", "idempotent": true, "guard": "recovery metadata present" },
+      { "from": "used", "on": "ancestor refresh", "to": null, "guard": "CREDENTIAL_INVALID" }
+    ],
+    "invariant": "token 生命周期不因恢复而延长"
+  },
+  "orderPairs": {
+    "meaning": "相邻顺序对：交换后是否改变判定。load-bearing 的对必须被测试钉住（R9）。",
+    "pairs": [
+      { "a": "transport.selected", "b": "secure.handshake", "kind": "load-bearing", "why": "Host 必须按 Control 顺序应用选路，否则两端可能把同一 Noise 通道绑到不同数据面", "test": null },
+      { "a": "connect.accepted", "b": "secure.handshake", "kind": "load-bearing", "why": "接受之前不得开始握手", "test": null },
+      { "a": "relay(counter n)", "b": "relay(counter n)", "kind": "load-bearing", "why": "counter 必须严格递增，重复即重放", "test": null },
+      { "a": "signal.ice", "b": "signal.offer", "kind": "tolerated", "why": "ICE 可早于 offer 到达，双方都容忍乱序", "test": null }
+    ]
+  }
+}

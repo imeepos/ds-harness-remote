@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ds-harness-remote.local/contract/grants.schema.json",
+  "title": "DSH-R grant-bound session",
+  "description": "Grant（静态授权）与 Lease（其在一条连接上的实例）。硬规则：expiresAt 必填——没有 TTL 的授权无法被撤销通道覆盖。",
+  "$defs": {
+    "deviceId": {
+      "type": "string",
+      "oneOf": [
+        { "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
+        { "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+        { "const": "*" }
+      ]
+    },
+    "verb": {
+      "enum": [
+        "register",
+        "attach",
+        "link.request",
+        "link.accept",
+        "frame.forward",
+        "ice.issue",
+        "revoke",
+        "directory.read",
+        "directory.write"
+      ]
+    },
+    "transport": { "enum": ["lan", "p2p", "turn", "relay"] },
+    "executionScope": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*([.:][a-z0-9*_-]+){0,3}$",
+      "maxLength": 64
+    },
+    "unixMs": { "type": "integer", "minimum": 0 },
+    "Grant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "issuer", "subject", "resource", "verbs", "issuedAt", "expiresAt", "state"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
+        "issuer": { "type": "string", "minLength": 1, "maxLength": 254 },
+        "subject": { "$ref": "#/$defs/deviceId" },
+        "resource": { "$ref": "#/$defs/deviceId" },
+        "verbs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/verb" }
+        },
+        "executionScopes": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/executionScope" }
+        },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "transports": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/transport" } },
+            "sessionBudget": { "type": "integer", "minimum": 1, "maximum": 10000 },
+            "maxConcurrent": { "type": "integer", "minimum": 1, "maximum": 16 }
+          }
+        },
+        "issuedAt": { "$ref": "#/$defs/unixMs" },
+        "expiresAt": { "$ref": "#/$defs/unixMs" },
+        "state": { "enum": ["active", "revoked", "exhausted", "expired"] },
+        "signature": { "type": "string", "minLength": 1, "maxLength": 8192 }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["expiresAt"] },
+          "then": {
+            "properties": { "expiresAt": { "minimum": 1 } }
+          }
+        }
+      ],
+      "description": "expiresAt 必须大于 issuedAt；无 TTL 的授权被 schema 拒绝（expiresAt 是必填项）。"
+    },
+    "Lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connectionId", "grantId", "clientDeviceId", "hostDeviceId", "verbs", "startedAt", "expiresAt"],
+      "properties": {
+        "connectionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "grantId": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
+        "clientDeviceId": { "$ref": "#/$defs/deviceId" },
+        "hostDeviceId": { "$ref": "#/$defs/deviceId" },
+        "verbs": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/verb" } },
+        "startedAt": { "$ref": "#/$defs/unixMs" },
+        "expiresAt": { "$ref": "#/$defs/unixMs" },
+        "transport": { "$ref": "#/$defs/transport" }
+      },
+      "description": "transport 只记录，不参与判定（I10）。"
+    },
+    "Receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "connectionId", "grantDigest", "clientDeviceId", "hostDeviceId", "startedAt", "endedAt", "counters", "hostKeyId", "sig"],
+      "properties": {
+        "v": { "const": 1 },
+        "connectionId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "grantDigest": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "clientDeviceId": { "$ref": "#/$defs/deviceId" },
+        "hostDeviceId": { "$ref": "#/$defs/deviceId" },
+        "transport": { "$ref": "#/$defs/transport" },
+        "startedAt": { "$ref": "#/$defs/unixMs" },
+        "endedAt": { "$ref": "#/$defs/unixMs" },
+        "counters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frames", "rpc", "tools", "bytes"],
+          "properties": {
+            "frames": { "type": "integer", "minimum": 0 },
+            "rpc": { "type": "integer", "minimum": 0 },
+            "tools": { "type": "integer", "minimum": 0 },
+            "bytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "hostKeyId": { "type": "string", "minLength": 1, "maxLength": 43 },
+        "sig": { "type": "string", "pattern": "^[A-Za-z0-9_-]{86}$" }
+      },
+      "description": "只含计数与摘要，不含明文。sig 为 64 字节 Ed25519/base64url，长度 86。"
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/Grant" },
+    { "$ref": "#/$defs/Lease" },
+    { "$ref": "#/$defs/Receipt" }
+  ]
+}

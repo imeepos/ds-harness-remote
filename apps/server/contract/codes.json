@@ -1,0 +1,53 @@
+{
+  "registry": "DSH-R decision codes",
+  "version": 1,
+  "meaning": "内部判定码封闭 12 个；线上 v1 码保持不变。check.mjs 校验：src 中出现的每一个 new ApiError('X') 必须属于 allowed 集合。新增码必须同时删一个（bounds.json）。",
+  "internal": [
+    { "id": "UNAUTHENTICATED", "family": "F1", "wire": ["AUTH_REQUIRED", "ACCOUNT_AUTH_REQUIRED"] },
+    { "id": "CREDENTIAL_INVALID", "family": "F1", "wire": ["AUTH_INVALID"] },
+    { "id": "CREDENTIAL_EXPIRED", "family": "F1", "wire": ["TOKEN_EXPIRED"] },
+    { "id": "SUBJECT_UNKNOWN", "family": "F1", "wire": ["DEVICE_NOT_FOUND"] },
+    { "id": "SUBJECT_REVOKED", "family": "F1", "wire": ["DEVICE_REVOKED"] },
+    { "id": "RELATION_MISSING", "family": "F4", "wire": ["MEMBERSHIP_REQUIRED", "DEVICE_OWNERSHIP_REQUIRED"] },
+    { "id": "PEER_MISMATCH", "family": "F3", "wire": ["PEER_IDENTITY_MISMATCH"] },
+    { "id": "SCOPE_NOT_GRANTED", "family": "F4", "wire": ["CAPABILITY_NOT_SUPPORTED"] },
+    { "id": "TARGET_OFFLINE", "family": "F4", "wire": ["HOST_OFFLINE"] },
+    { "id": "LINK_UNKNOWN", "family": "F4", "wire": ["CONNECTION_NOT_FOUND"] },
+    { "id": "LINK_STATE", "family": "F4", "wire": ["INVALID_MESSAGE"] },
+    { "id": "QUOTA_EXCEEDED", "family": null, "wire": ["RATE_LIMITED", "FRAME_TOO_LARGE"] }
+  ],
+  "wireOnly": {
+    "meaning": "不来自判定的线上码：格式错误、诊断、运维。保持原样，不进内部封闭集。",
+    "codes": [
+      "INVALID_MESSAGE",
+      "UNSUPPORTED_VERSION",
+      "METHOD_NOT_FOUND",
+      "METHOD_NOT_ALLOWED",
+      "REQUEST_CONFLICT",
+      "INTERNAL_ERROR",
+      "CONNECTION_FAILED",
+      "CONNECTION_REPLACED",
+      "SLOW_CONSUMER",
+      "P2P_FAILED",
+      "TURN_UNAVAILABLE",
+      "RELAY_UNAVAILABLE",
+      "SECURE_CHANNEL_FAILED"
+    ]
+  },
+  "wire": {
+    "meaning": "协议 §23 的 40 个标准码。内部码与 wireOnly 都必须是它的子集；不在其中的码属于扩展前缀，当前服务器不使用。",
+    "codes": [
+      "INVALID_MESSAGE", "UNSUPPORTED_VERSION", "CAPABILITY_NOT_SUPPORTED", "METHOD_NOT_FOUND",
+      "METHOD_NOT_ALLOWED", "REQUEST_CONFLICT", "FRAME_TOO_LARGE", "RATE_LIMITED",
+      "AUTH_REQUIRED", "AUTH_INVALID", "ACCOUNT_AUTH_REQUIRED", "TOKEN_EXPIRED",
+      "DEVICE_NOT_FOUND", "DEVICE_REVOKED", "DEVICE_OWNERSHIP_REQUIRED", "MEMBERSHIP_REQUIRED",
+      "PEER_IDENTITY_MISMATCH", "HOST_REGISTRATION_CODE_NOT_FOUND", "HOST_REGISTRATION_CODE_EXPIRED",
+      "HOST_REGISTRATION_CODE_CONSUMED", "HOST_OFFLINE", "CONNECTION_NOT_FOUND", "CONNECTION_FAILED",
+      "CONNECTION_REPLACED", "P2P_FAILED", "TURN_UNAVAILABLE", "RELAY_UNAVAILABLE", "SLOW_CONSUMER",
+      "SECURE_CHANNEL_FAILED", "HARNESS_UNAVAILABLE", "HARNESS_VERSION_INCOMPATIBLE",
+      "RESPONSE_TOO_LARGE", "SESSION_NOT_FOUND", "SESSION_NOT_READY", "AGENT_BUSY",
+      "PERMISSION_DENIED", "PERMISSION_NOT_PENDING", "RPC_TIMEOUT", "FULL_RESYNC_REQUIRED",
+      "INTERNAL_ERROR"
+    ]
+  }
+}

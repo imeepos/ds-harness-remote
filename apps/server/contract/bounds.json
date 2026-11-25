@@ -1,0 +1,34 @@
+{
+  "registry": "DSH-R bounds",
+  "version": 2,
+  "meaning": "架构上界。超过任何一项即视为『更大』，必须显式批准并同时修订本文件。本版（融合 S1+S2）只新增授权与租约两个判定点，不动既有 65 处校验。",
+  "bounds": {
+    "decisionEntryPoints": {
+      "limit": 2,
+      "current": 2,
+      "enforced": "check.mjs B6：src 中恰好一处 authorize( 定义、一处 allows( 定义"
+    },
+    "verbs": { "limit": 9, "current": 9, "enforced": "verbs.json" },
+    "internalCodes": { "limit": 12, "current": 12, "enforced": "codes.json" },
+    "ports": { "limit": 5, "current": 2, "enforced": "P2 目录（GrantStore）与 P4 时钟（now 注入）已落地；P1/P3/P5 仍是内联实现" },
+    "stateMachines": { "limit": 3, "current": 3, "enforced": "state.json" },
+    "newWireFields": { "limit": 0, "current": 0, "enforced": "协议 fixtures 不变；grants.v1 是 capability 字符串，不是帧字段" }
+  },
+  "routes": {
+    "meaning": "路由数上限。新增路由必须映射到既有动词。",
+    "limit": 20,
+    "current": 20,
+    "breakdown": { "verbs": 16, "nonVerbs": 4, "health": 3 }
+  },
+  "growthLaw": [
+    "新增需求只能是 (verb, subject, scope) 元组或已有端口的新适配器",
+    "新增动词必须同时删一个",
+    "新增内部码必须同时删一个",
+    "核心不得引入 I/O / 时间 / 环境 / 日志"
+  ],
+  "invariants": {
+    "I13": "连接 ⊆ 授权：每次 frame.forward / ice.issue 都命中未过期租约（gateway 转发前检查）",
+    "I14": "授权 ⊆ 连接：撤销/到期只经 endLease 一个出口结束租约",
+    "I10": "判定不读实际路径：由 check.mjs D1 静态门禁钉住"
+  }
+}

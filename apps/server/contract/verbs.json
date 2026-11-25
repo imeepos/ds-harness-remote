@@ -1,0 +1,112 @@
+{
+  "registry": "DSH-R decision verbs",
+  "version": 2,
+  "meaning": "9 个动词是判定的全部输入。每个 REST 路由与 control frame 必须映射到恰好一个动词，或显式列入 nonVerbs。check.mjs 双向校验本表与 src/server.ts、src/gateway.ts。授权（Grant）是目录记录，因此三个 /grants 端点分别骑在 directory.write / directory.read / revoke 上——不新增动词。",
+  "verbs": [
+    {
+      "id": "register",
+      "kind": "decision",
+      "family": ["F1", "F4"],
+      "routes": [
+        { "method": "POST", "path": "/api/v1/devices/register" },
+        { "method": "POST", "path": "/api/v1/devices/register-owned-role" }
+      ],
+      "frames": [],
+      "today": ["src/server.ts:265-271"]
+    },
+    {
+      "id": "attach",
+      "kind": "decision",
+      "family": ["F1", "F2", "F3"],
+      "routes": [],
+      "frames": ["hello"],
+      "today": ["src/gateway.ts:431-471"]
+    },
+    {
+      "id": "link.request",
+      "kind": "decision",
+      "family": ["F4"],
+      "routes": [],
+      "frames": ["connect.request"],
+      "today": ["src/gateway.ts:529-573"]
+    },
+    {
+      "id": "link.accept",
+      "kind": "decision",
+      "family": ["F4"],
+      "routes": [],
+      "frames": ["connect.accepted", "connect.rejected"],
+      "today": ["src/gateway.ts:582-591"]
+    },
+    {
+      "id": "frame.forward",
+      "kind": "decision",
+      "family": ["F4"],
+      "routes": [],
+      "frames": ["secure.handshake", "signal.offer", "signal.answer", "signal.ice", "transport.selected", "relay"],
+      "today": ["src/gateway.ts:593-611"]
+    },
+    {
+      "id": "ice.issue",
+      "kind": "decision",
+      "family": ["F4"],
+      "routes": [{ "method": "GET", "path": "/api/v1/turn/credentials" }],
+      "frames": [],
+      "today": ["src/server.ts:280-286"]
+    },
+    {
+      "id": "revoke",
+      "kind": "write",
+      "family": ["F1"],
+      "routes": [
+        { "method": "DELETE", "path": "/api/v1/devices/self" },
+        { "method": "DELETE", "path": "/api/v1/grants/{id}", "source": "\\/api\\/v1\\/grants\\/([^/]+)" }
+      ],
+      "frames": [],
+      "today": ["src/server.ts:276-278", "src/store.ts:120"]
+    },
+    {
+      "id": "directory.read",
+      "kind": "read",
+      "family": ["F4"],
+      "routes": [
+        { "method": "GET", "path": "/api/v1/account/devices" },
+        { "method": "GET", "path": "/api/v1/devices" },
+        { "method": "GET", "path": "/api/v1/grants" },
+        { "method": "GET", "path": "/api/v1/receipts" },
+        { "method": "GET", "path": "/api/v1/me" },
+        { "method": "GET", "path": "/api/v1/devices/{id}", "source": "devices\\/([^/]+)(" },
+        { "method": "GET", "path": "/api/v1/devices/{id}/presence", "source": "([^/]+)(\\/presence)?" }
+      ],
+      "frames": [],
+      "today": ["src/server.ts:258-264", "src/server.ts:287-309"]
+    },
+    {
+      "id": "directory.write",
+      "kind": "write",
+      "family": ["F4"],
+      "routes": [
+        { "method": "POST", "path": "/api/v1/grants" },
+        { "method": "POST", "path": "/api/v1/receipts" },
+        { "method": "POST", "path": "/api/v1/devices/self/receipt-key" },
+        { "method": "POST", "path": "/api/v1/devices/{id}/name", "source": "devices\\/([^/]+)\\/name" }
+      ],
+      "frames": [],
+      "today": ["src/server.ts:296-302"]
+    }
+  ],
+  "nonVerbs": {
+    "meaning": "不产生判定结论的路由与帧；它们不得被当作授权入口",
+    "routes": [
+      { "method": "POST", "path": "/api/v1/auth/login" },
+      { "method": "GET", "path": "/api/v1/auth/me" },
+      { "method": "POST", "path": "/api/v1/auth/logout" },
+      { "method": "POST", "path": "/api/v1/auth/refresh" }
+    ],
+    "health": ["/health", "/healthz", "/ready"],
+    "frames": ["hello.ack", "connect.incoming", "connect.rejected", "ping", "pong", "error"]
+  },
+  "capabilities": {
+    "grants.v1": "Host 声明后才承接执行级收窄（executionScopes）；Server 仅在接入授权存储时宣告。"
+  }
+}
