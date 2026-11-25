@@ -121,6 +121,37 @@ export interface RemoteCompactionRoute {
   owner: RemoteCompactionOwner
 }
 
+/**
+ * 执行级范围表：方法前缀 → 所需 scope。
+ *
+ * 这是**数据**，不是策略语言：表外的方法在收窄后一律拒绝（缺省即拒）。
+ * 顺序敏感——更长的前缀写在前面。
+ */
+const EXECUTION_SCOPE_TABLE: ReadonlyArray<readonly [string, string]> = [
+  ['session.transfer.', 'session:write'],
+  ['workspace.upload.', 'session:write'],
+  ['workspace.git.', 'files:read'],
+  ['workspace.', 'files:read'],
+  ['fileviewer.', 'files:read'],
+  ['dsh.web.', 'session:write'],
+  ['terminal.', 'terminal'],
+  ['session.', 'session:read'],
+  ['host.', 'session:read'],
+  ['system.', 'session:read'],
+  ['harness.', 'tools'],
+  ['codex.', 'tools'],
+  ['agent.', 'tools'],
+  ['plugin.route.', 'tools'],
+]
+
+/** 返回该方法所需 scope；表外返回 undefined（收窄后即拒绝）。 */
+export function requiredExecutionScope(method: string): string | undefined {
+  for (const [prefix, scope] of EXECUTION_SCOPE_TABLE) {
+    if (method.startsWith(prefix)) return scope
+  }
+  return undefined
+}
+
 export class RpcRouter {
   private active = 0
 
@@ -144,6 +175,8 @@ export class RpcRouter {
     private readonly lanWeb?: DshWebLanPeer,
     private readonly sameLinkIpv6Endpoints?: AuthenticatedPeerChannel['sameLinkIpv6Endpoints'],
     private readonly workspaceGit?: WorkspaceGitHost,
+    /** 执行级范围：undefined = 未收窄（旧 Server / 无 scopes 的委托）。 */
+    private readonly executionScopes?: readonly string[],
   ) {}
 
   async closePeerStreams(): Promise<void> {
@@ -170,6 +203,13 @@ export class RpcRouter {
     if (!parsedPayload.success) return createRpcError(message.id, 'INVALID_MESSAGE', 'The RPC request payload is invalid.')
     if (!apiMethods.has(parsedPayload.data.method)) {
       return createRpcError(message.id, 'METHOD_NOT_FOUND', 'The requested method does not exist.')
+    }
+    // 执行级收窄：一次判定，覆盖所有 RPC。缺省拒绝——表里没登记的方法在收窄后一律不允许。
+    if (this.executionScopes !== undefined) {
+      const required = requiredExecutionScope(parsedPayload.data.method)
+      if (required === undefined || !this.executionScopes.includes(required)) {
+        return createRpcError(message.id, 'PERMISSION_DENIED', 'The grant does not cover this operation.')
+      }
     }
     const request = message as RemoteMessage<RpcRequestPayload>
     if (this.active >= this.maxPending) {

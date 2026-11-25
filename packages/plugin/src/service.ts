@@ -14,6 +14,8 @@ import { createEvent, REMOTE_SESSION_EVENTS_CAPABILITY, type RemoteWorkspaceType
 import { ConnectionController } from './connection-controller.js'
 import type { ResolvedConfig } from './config.js'
 import type { HostIdentity, IdentityStore } from './identity-store.js'
+import { ReceiptSigner } from './receipt-signer.js'
+import { diagnosticReason } from './client-runtime-contract.js'
 import {
   harnessSessionGeneration,
   isLiveSessionEventsHarnessVersion,
@@ -83,6 +85,9 @@ export class HostPluginRuntime {
   private readonly uploadBudget = new WorkspaceUploadBudget()
   private readonly loopbackHosts = new Set<LoopbackHost>()
   private terminalEnabled: boolean
+  private readonly grantsEnabled: boolean = false
+  private receiptSigner: ReceiptSigner | undefined
+  private receiptKeyPublished = false
   private loopbackPorts: readonly number[]
   private identity?: HostIdentity
   private readonly serverApi?: HostServerApi
@@ -121,6 +126,7 @@ export class HostPluginRuntime {
     attachmentHostPath?: (ref: MessageFileAttachment) => string | undefined,
   ) {
     this.terminalEnabled = config.terminal.enabled
+    this.grantsEnabled = config.grants?.enabled === true
     this.loopbackPorts = [...config.loopback.ports]
     this.codex = new CodexRemoteDomain(config.codex, logger)
     this.acp = new AcpRemoteGateway(
@@ -257,6 +263,8 @@ export class HostPluginRuntime {
           ? new DshWebLanPeer(resolveDshWeb, context.transportMode, context.lanWebAddress) : undefined,
         context.sameLinkIpv6Endpoints,
         workspaceGit,
+        // 鎵ц绾ц寖鍥撮殢杩炴帴涓嬪彂锛泆ndefined 琛ㄧず鏈敹绐勶紙鏃?Server / 鏃?scopes 鐨勫鎵橈級銆?
+        context.executionScopes,
       )
     }, this.logger)
     if (config.serverUrl !== undefined) {
@@ -621,7 +629,44 @@ export class HostPluginRuntime {
         : () => loadNodeRtcFactory({ routeTargets: this.config.serverUrl === undefined ? [] : [this.config.serverUrl] }),
       () => this.hostCapabilities(),
       this.harnessVersion,
+      (info) => this.reportReceipt(info),
     )
+  }
+
+  /**
+   * 浼氳瘽缁撴潫鍥炴墽锛氶粯璁ゅ叧闂€傚紑鍚悗 Host 鐢ㄦ湰鏈虹殑 Ed25519 鍥炴墽瀵嗛挜绛惧悕骞舵彁浜わ紝
+   * Server 鍙帴鍙椾笌瀹冭嚜宸辫璇佷竴鑷寸殑浼氳瘽锛堣繛鎺?濮旀墭/瀵圭锛夛紝璁℃暟鍚勮嚜鐙珛銆?
+   */
+  private reportReceipt(info: { connectionId: string; grantId: string; clientDeviceId: string; startedAt: number; frames: number; bytes: number }): void {
+    if (!this.grantsEnabled || !this.config.grants?.receiptSigning) return
+    const api = this.serverApi
+    const identity = this.identity
+    if (api === undefined || identity === undefined) return
+    try {
+      const signer = (this.receiptSigner ??= ReceiptSigner.load(this.identities.directory))
+      const receipt = {
+        connectionId: info.connectionId,
+        grantId: info.grantId,
+        clientDeviceId: info.clientDeviceId,
+        hostDeviceId: identity.deviceId,
+        startedAt: info.startedAt,
+        endedAt: Date.now(),
+        counters: { frames: info.frames, bytes: info.bytes },
+      }
+      const signature = signer.sign(ReceiptSigner.signingInput(receipt))
+      void (async () => {
+        // 先登记公钥再提交：Server 只接受已登记钥匙签出的回执（防自签）。
+        if (!this.receiptKeyPublished) {
+          await api.publishReceiptKey(signer.publicKey)
+          this.receiptKeyPublished = true
+        }
+        await api.submitReceipt({ ...receipt, signer: signer.publicKey, sig: signature })
+      })().catch((error: unknown) => {
+        this.logger.warn('receipt submission failed', { reason: diagnosticReason(error instanceof Error ? error : new Error(String(error))) })
+      })
+    } catch (error) {
+      this.logger.warn('receipt signing unavailable', { reason: diagnosticReason(error instanceof Error ? error : new Error(String(error))) })
+    }
   }
 
   private async readHarnessVersion(): Promise<string | undefined> {
@@ -632,6 +677,9 @@ export class HostPluginRuntime {
 
   private hostCapabilities(): string[] {
     const capabilities: string[] = ['workspace.upload.v1']
+    // grants.v1 鏄?*鍙€夎兘鍔?*锛氶粯璁や笉瀹ｅ憡锛屾棫鐨?Server 涓庢棦鏈夊鎴风琛屼负閫愬瓧鑺備笉鍙樸€?
+    // 鎵撳紑鍚?Server 鎵嶅厑璁镐负鏈満绛惧彂甯?executionScopes 鐨勫鎵橈紝骞跺湪瑙ｆ瀽瀵圭鏃朵笅鍙戙€?
+    if (this.grantsEnabled) capabilities.push('grants.v1')
     if (this.loopbackPorts.length > 0) capabilities.push('loopback.http-ws.v1')
     if (this.localGateway?.supportsCarrier === true) {
       capabilities.push(
@@ -778,7 +826,7 @@ export class HostPluginRuntime {
   }
 }
 
-function shortId(value: string): string { return value.length <= 12 ? value : `${value.slice(0, 8)}…${value.slice(-4)}` }
+function shortId(value: string): string { return value.length <= 12 ? value : `${value.slice(0, 8)}鈥?{value.slice(-4)}` }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)

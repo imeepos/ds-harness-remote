@@ -13,6 +13,11 @@ export interface AuthenticatedPeerChannel {
   }
   readonly peerDeviceId: string
   readonly peerIdentityKey: string
+  /**
+   * 本连接的执行级范围（来自 Server 下发的 grants.executionScopes）。
+   * 缺省表示"未收窄"：旧 Server 不下发、或覆盖该关系的委托没有 executionScopes。
+   */
+  readonly executionScopes?: readonly string[]
   readonly sameLinkIpv6Endpoints?: (pair?: SameLinkIpv6Pair) => Promise<string[]>
   readonly lanWebAddress?: (pair?: SameLinkIpv6Pair) => Promise<string | undefined>
   readonly mode?: 'LAN' | 'P2P' | 'TURN' | 'Relay'

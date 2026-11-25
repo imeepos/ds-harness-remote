@@ -64,9 +64,17 @@ export interface ServerHostDevice {
   harnessVersion?: string
 }
 
+export interface PeerExecutionGrant {
+  id: string
+  expiresAt: number
+  executionScopes?: string[]
+}
+
 export interface AuthorizedPeerDevice extends ServerHostDevice {
   role: 'host' | 'client'
   identityKey: string
+  /** 覆盖这条对端关系的委托（仅 Server 侧 grants.v1 时下发）。旧 Server 不返回。 */
+  grants?: PeerExecutionGrant[]
 }
 
 export interface DshWebRequest {
@@ -493,6 +501,32 @@ export class HostServerApi {
     return parseAuthorizedPeer(result)
   }
 
+  /** 登记本机的回执签名公钥（幂等）：Server 用它作为签名回执的信任锚。 */
+  async publishReceiptKey(receiptSigningKey: string): Promise<void> {
+    await this.request('/api/v1/devices/self/receipt-key', {
+      method: 'POST',
+      body: JSON.stringify({ v: 1, receiptSigningKey }),
+    })
+  }
+
+  /**
+   * 会话结束回执（Host 签名）。Server 只接受与它自己见证一致的会话，
+   * 因此这里不是"报销"而是"双签"：Server 数它搬运的帧，Host 数它通道上的帧。
+   */
+  async submitReceipt(receipt: {
+    connectionId: string
+    grantId: string
+    clientDeviceId: string
+    hostDeviceId: string
+    startedAt: number
+    endedAt: number
+    counters: { frames: number; bytes: number }
+    signer: string
+    sig: string
+  }): Promise<void> {
+    await this.request('/api/v1/receipts', { method: 'POST', body: JSON.stringify({ v: 1, receipt }) })
+  }
+
   async turnCredentials(connectionId: string): Promise<RtcIceServer[]> {
     const result = await this.request<{ iceServers?: unknown }>(
       `/api/v1/turn/credentials?connection_id=${encodeURIComponent(connectionId)}`,
@@ -802,7 +836,25 @@ function parseAuthorizedPeer(value: unknown): AuthorizedPeerDevice {
     membershipId: item.membershipId,
     ...(typeof item.online === 'boolean' ? { online: item.online } : {}),
     ...(typeof item.lastSeenAt === 'number' && Number.isSafeInteger(item.lastSeenAt) ? { lastSeenAt: item.lastSeenAt } : {}),
+    ...(parsePeerGrants(item.grants) === undefined ? {} : { grants: parsePeerGrants(item.grants)! }),
   }
+}
+
+/** 宽松解析：委托是可选增强，格式不对就当作没下发，不能因此拒绝连接。 */
+function parsePeerGrants(value: unknown): PeerExecutionGrant[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const grants: PeerExecutionGrant[] = []
+  for (const raw of value.slice(0, 8)) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const grant = raw as Record<string, unknown>
+    if (typeof grant.id !== 'string' || grant.id.length === 0) continue
+    if (typeof grant.expiresAt !== 'number' || !Number.isSafeInteger(grant.expiresAt)) continue
+    const scopes = Array.isArray(grant.executionScopes)
+      ? grant.executionScopes.filter((scope): scope is string => typeof scope === 'string' && /^[a-z][a-z0-9]*([.:][a-z0-9*_-]+){0,3}$/u.test(scope))
+      : undefined
+    grants.push({ id: grant.id, expiresAt: grant.expiresAt, ...(scopes === undefined ? {} : { executionScopes: scopes }) })
+  }
+  return grants.length === 0 ? undefined : grants
 }
 
 function parseIceServer(value: unknown): RtcIceServer {

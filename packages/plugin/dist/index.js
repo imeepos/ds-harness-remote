@@ -87795,6 +87795,7 @@ var entryConfigSchema = Schema.object({
   httpServerAllowlist: Schema.array(Schema.string()),
   deviceName: Schema.string(),
   terminal: Schema.object({ enabled: Schema.boolean() }),
+  grants: Schema.object({ enabled: Schema.boolean(), receiptSigning: Schema.boolean() }),
   remoteTools: Schema.object({ enabled: Schema.boolean() }),
   sidebar: Schema.object({ entry: Schema.union(["standard", "compact"]) }),
   hostControl: Schema.object({ enabled: Schema.boolean() }),
@@ -87840,6 +87841,8 @@ var configSchema = external_exports.object({
   httpServerAllowlist: external_exports.array(external_exports.string().trim().min(1).max(128)).max(64).optional(),
   deviceName: external_exports.string().trim().min(1).max(80).optional(),
   terminal: external_exports.object({ enabled: external_exports.boolean().optional() }).strict().optional(),
+  /** 执行级收窄（grants.v1）：默认关闭，开启后 Host 才会宣告并消费委托。 */
+  grants: external_exports.object({ enabled: external_exports.boolean().optional(), receiptSigning: external_exports.boolean().optional() }).strict().optional(),
   remoteTools: external_exports.object({ enabled: external_exports.boolean().optional() }).strict().optional(),
   sidebar: external_exports.object({ entry: external_exports.enum(["standard", "compact"]).optional() }).strict().optional(),
   hostControl: external_exports.object({ enabled: external_exports.boolean().optional() }).strict().optional(),
@@ -87867,6 +87870,7 @@ function resolveConfig(input4 = {}, env = process.env) {
   const codexEnabled = codexBackend?.enabled ?? parsed.codex?.enabled ?? true;
   const acpEnabled = parsed.acp?.enabled ?? true;
   const reconnect = typeof parsed.reconnect === "object" ? parsed.reconnect : {};
+  const grantsEnabled = parsed.grants?.enabled ?? env.DSH_REMOTE_GRANTS_ENABLED === "true";
   const configuredServerUrl = parsed.serverUrl ?? env.DSH_REMOTE_SERVER;
   const httpServerAllowlist = normalizeHttpServerAllowlist(
     parsed.httpServerAllowlist ?? parseHttpServerAllowlistEnv(env.DSH_REMOTE_HTTP_SERVER_ALLOWLIST)
@@ -87885,6 +87889,10 @@ function resolveConfig(input4 = {}, env = process.env) {
     deviceName: parsed.deviceName ?? env.DSH_REMOTE_DEVICE_NAME ?? hostname3(),
     hostControl: { enabled: parsed.hostControl?.enabled ?? true },
     terminal: { enabled: parsed.terminal?.enabled ?? (env.DSH_REMOTE_TERMINAL_ENABLED === void 0 || env.DSH_REMOTE_TERMINAL_ENABLED === "true") },
+    grants: {
+      enabled: grantsEnabled,
+      receiptSigning: parsed.grants?.receiptSigning ?? grantsEnabled
+    },
     remoteTools: { enabled: parsed.remoteTools?.enabled ?? true },
     sidebar: { entry: parsed.sidebar?.entry === "compact" ? "compact" : "standard" },
     loopback: { ports: [...new Set(parsed.loopback?.ports ?? [])] },
@@ -88407,6 +88415,20 @@ var HostServerApi = class {
     const result = await this.request(`/api/v1/devices/${encodeURIComponent(peerDeviceId)}`, { signal });
     return parseAuthorizedPeer(result);
   }
+  /** 登记本机的回执签名公钥（幂等）：Server 用它作为签名回执的信任锚。 */
+  async publishReceiptKey(receiptSigningKey) {
+    await this.request("/api/v1/devices/self/receipt-key", {
+      method: "POST",
+      body: JSON.stringify({ v: 1, receiptSigningKey })
+    });
+  }
+  /**
+   * 会话结束回执（Host 签名）。Server 只接受与它自己见证一致的会话，
+   * 因此这里不是"报销"而是"双签"：Server 数它搬运的帧，Host 数它通道上的帧。
+   */
+  async submitReceipt(receipt) {
+    await this.request("/api/v1/receipts", { method: "POST", body: JSON.stringify({ v: 1, receipt }) });
+  }
   async turnCredentials(connectionId) {
     const result = await this.request(
       `/api/v1/turn/credentials?connection_id=${encodeURIComponent(connectionId)}`
@@ -88664,8 +88686,22 @@ function parseAuthorizedPeer(value) {
     identityKey: item.identityKey,
     membershipId: item.membershipId,
     ...typeof item.online === "boolean" ? { online: item.online } : {},
-    ...typeof item.lastSeenAt === "number" && Number.isSafeInteger(item.lastSeenAt) ? { lastSeenAt: item.lastSeenAt } : {}
+    ...typeof item.lastSeenAt === "number" && Number.isSafeInteger(item.lastSeenAt) ? { lastSeenAt: item.lastSeenAt } : {},
+    ...parsePeerGrants(item.grants) === void 0 ? {} : { grants: parsePeerGrants(item.grants) }
   };
+}
+function parsePeerGrants(value) {
+  if (!Array.isArray(value)) return void 0;
+  const grants = [];
+  for (const raw of value.slice(0, 8)) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const grant = raw;
+    if (typeof grant.id !== "string" || grant.id.length === 0) continue;
+    if (typeof grant.expiresAt !== "number" || !Number.isSafeInteger(grant.expiresAt)) continue;
+    const scopes = Array.isArray(grant.executionScopes) ? grant.executionScopes.filter((scope3) => typeof scope3 === "string" && /^[a-z][a-z0-9]*([.:][a-z0-9*_-]+){0,3}$/u.test(scope3)) : void 0;
+    grants.push({ id: grant.id, expiresAt: grant.expiresAt, ...scopes === void 0 ? {} : { executionScopes: scopes } });
+  }
+  return grants.length === 0 ? void 0 : grants;
 }
 function parseIceServer(value) {
   const item = requireRecord(value, "ICE server");
@@ -108732,7 +108768,7 @@ var ConnectionController = class {
     }
     await Promise.all(replaced.map((connection2) => this.disconnect(connection2, "CONNECTION_REPLACED")));
     const router = this.createRouter(
-      { connectionId, peerDeviceId: channel.peerDeviceId, peerIdentityKey: channel.peerIdentityKey, transportMode: () => channel.mode, sameLinkIpv6Endpoints: channel.sameLinkIpv6Endpoints?.bind(channel), lanWebAddress: channel.lanWebAddress?.bind(channel), createTransportUpgradeHost: channel.createTransportUpgradeHost?.bind(channel) },
+      { connectionId, peerDeviceId: channel.peerDeviceId, peerIdentityKey: channel.peerIdentityKey, executionScopes: channel.executionScopes, transportMode: () => channel.mode, sameLinkIpv6Endpoints: channel.sameLinkIpv6Endpoints?.bind(channel), lanWebAddress: channel.lanWebAddress?.bind(channel), createTransportUpgradeHost: channel.createTransportUpgradeHost?.bind(channel) },
       (message) => this.sendTo(connectionId, channel, message)
     );
     const connection = {
@@ -108907,6 +108943,58 @@ function isRecord24(value) {
 function shortId2(value) {
   return value.length <= 12 ? value : `${value.slice(0, 8)}\u2026${value.slice(-4)}`;
 }
+
+// packages/plugin/src/receipt-signer.ts
+import { createPrivateKey as createPrivateKey5, createPublicKey as createPublicKey3, generateKeyPairSync as generateKeyPairSync2, sign as signWithKey } from "node:crypto";
+import { chmodSync, existsSync as existsSync5, mkdirSync, readFileSync as readFileSync3, writeFileSync } from "node:fs";
+import { join as join19 } from "node:path";
+var ReceiptSigner = class _ReceiptSigner {
+  constructor(keyPem, publicKey) {
+    this.keyPem = keyPem;
+    this.publicKey = publicKey;
+  }
+  static FILE_NAME = "receipt-signing.key.pem";
+  static load(directory) {
+    const file2 = join19(directory, _ReceiptSigner.FILE_NAME);
+    if (existsSync5(file2)) {
+      const keyPem2 = readFileSync3(file2, "utf8");
+      return new _ReceiptSigner(keyPem2, _ReceiptSigner.publicKeyOf(keyPem2));
+    }
+    mkdirSync(directory, { recursive: true, mode: 448 });
+    const { privateKey } = generateKeyPairSync2("ed25519");
+    const keyPem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    writeFileSync(file2, keyPem, { mode: 384 });
+    try {
+      chmodSync(file2, 384);
+    } catch {
+    }
+    return new _ReceiptSigner(keyPem, _ReceiptSigner.publicKeyOf(keyPem));
+  }
+  /** SPKI DER 的末 32 字节就是 Ed25519 原始公钥。 */
+  static publicKeyOf(keyPem) {
+    const der = createPublicKey3(createPrivateKey5(keyPem)).export({ format: "der", type: "spki" });
+    return Buffer.from(der.subarray(der.length - 32)).toString("base64url");
+  }
+  /**
+   * 规范签名输入：与 contract/verify-receipt.mjs 完全一致的数组形式，
+   * 避免键序、空白与浮点格式带来的歧义。
+   */
+  static signingInput(receipt) {
+    return JSON.stringify([
+      receipt.connectionId,
+      receipt.grantId,
+      receipt.clientDeviceId,
+      receipt.hostDeviceId,
+      receipt.startedAt,
+      receipt.endedAt,
+      receipt.counters.frames,
+      receipt.counters.bytes
+    ]);
+  }
+  sign(input4) {
+    return signWithKey(null, Buffer.from(input4, "utf8"), createPrivateKey5(this.keyPem)).toString("base64url");
+  }
+};
 
 // packages/plugin/src/transport-upgrade.ts
 var TransportUpgradeHost = class {
@@ -109201,8 +109289,30 @@ var HOST_CAPABILITIES = [
   "agent.acp.v1",
   "agent.acp.transfer.v1"
 ];
+var EXECUTION_SCOPE_TABLE = [
+  ["session.transfer.", "session:write"],
+  ["workspace.upload.", "session:write"],
+  ["workspace.git.", "files:read"],
+  ["workspace.", "files:read"],
+  ["fileviewer.", "files:read"],
+  ["dsh.web.", "session:write"],
+  ["terminal.", "terminal"],
+  ["session.", "session:read"],
+  ["host.", "session:read"],
+  ["system.", "session:read"],
+  ["harness.", "tools"],
+  ["codex.", "tools"],
+  ["agent.", "tools"],
+  ["plugin.route.", "tools"]
+];
+function requiredExecutionScope(method) {
+  for (const [prefix, scope3] of EXECUTION_SCOPE_TABLE) {
+    if (method.startsWith(prefix)) return scope3;
+  }
+  return void 0;
+}
 var RpcRouter = class {
-  constructor(maxPending = 128, logger2, fileViewer, harnessRemote, capabilities = () => HOST_CAPABILITIES, codex, acp, loopback, workspaceTypes, pluginRoute, workspaceUpload, compaction, lanUpload, transportUpgrade, sessionTransfer, dshWeb, lanWeb, sameLinkIpv6Endpoints, workspaceGit) {
+  constructor(maxPending = 128, logger2, fileViewer, harnessRemote, capabilities = () => HOST_CAPABILITIES, codex, acp, loopback, workspaceTypes, pluginRoute, workspaceUpload, compaction, lanUpload, transportUpgrade, sessionTransfer, dshWeb, lanWeb, sameLinkIpv6Endpoints, workspaceGit, executionScopes) {
     this.maxPending = maxPending;
     this.logger = logger2;
     this.fileViewer = fileViewer;
@@ -109222,6 +109332,7 @@ var RpcRouter = class {
     this.lanWeb = lanWeb;
     this.sameLinkIpv6Endpoints = sameLinkIpv6Endpoints;
     this.workspaceGit = workspaceGit;
+    this.executionScopes = executionScopes;
   }
   active = 0;
   async closePeerStreams() {
@@ -109247,6 +109358,12 @@ var RpcRouter = class {
     if (!parsedPayload.success) return createRpcError(message.id, "INVALID_MESSAGE", "The RPC request payload is invalid.");
     if (!apiMethods.has(parsedPayload.data.method)) {
       return createRpcError(message.id, "METHOD_NOT_FOUND", "The requested method does not exist.");
+    }
+    if (this.executionScopes !== void 0) {
+      const required2 = requiredExecutionScope(parsedPayload.data.method);
+      if (required2 === void 0 || !this.executionScopes.includes(required2)) {
+        return createRpcError(message.id, "PERMISSION_DENIED", "The grant does not cover this operation.");
+      }
     }
     const request2 = message;
     if (this.active >= this.maxPending) {
@@ -109662,7 +109779,7 @@ function resolveWebRtcNegotiateTimeoutMs(hint) {
   return Math.min(MAX_WEBRTC_NEGOTIATE_TIMEOUT_MS, Math.max(MIN_WEBRTC_NEGOTIATE_TIMEOUT_MS, hint));
 }
 var HostServerConnection = class {
-  constructor(config2, identity3, identities, api, connections, logger2, createWebSocket = (url2) => createNodeWebSocket(url2), rtcFactoryProvider, hostCapabilities = () => [], harnessVersion) {
+  constructor(config2, identity3, identities, api, connections, logger2, createWebSocket = (url2) => createNodeWebSocket(url2), rtcFactoryProvider, hostCapabilities = () => [], harnessVersion, reportReceipt) {
     this.config = config2;
     this.identity = identity3;
     this.identities = identities;
@@ -109673,6 +109790,7 @@ var HostServerConnection = class {
     this.rtcFactoryProvider = rtcFactoryProvider;
     this.hostCapabilities = hostCapabilities;
     this.harnessVersion = harnessVersion;
+    this.reportReceipt = reportReceipt;
   }
   socket;
   forceCloseSocket;
@@ -110228,12 +110346,18 @@ var HostServerConnection = class {
       remotePublicKey: peer.publicKey,
       prologue: createNoisePrologue(payload.connectionId, this.identity.deviceId, peer.deviceId)
     });
+    const coveringGrants = descriptor.grants ?? [];
+    const scopedGrants = coveringGrants.filter((grant) => grant.executionScopes !== void 0);
+    const executionScopes = coveringGrants.length > 0 && scopedGrants.length === coveringGrants.length ? [...new Set(scopedGrants.flatMap((grant) => grant.executionScopes ?? []))] : void 0;
     const tunnel = {
       recoveryTicket: this.negotiatedCapabilities.includes(WEBRTC_RESUME_CAPABILITY) ? payload.recoveryTicket : void 0,
       relayRecoveryTicket: this.negotiatedCapabilities.includes(RELAY_RESUME_CAPABILITY) ? payload.relayRecoveryTicket : void 0,
       connectionId: payload.connectionId,
       membershipId: descriptor.membershipId,
       peer,
+      createdAt: Date.now(),
+      ...coveringGrants[0] === void 0 ? {} : { grantId: coveringGrants[0].id },
+      ...executionScopes === void 0 ? {} : { executionScopes },
       preferredTransports: payload.preferredTransports,
       noise,
       transport: "negotiating",
@@ -110866,6 +110990,19 @@ var HostServerConnection = class {
     socket.send(encodeControlFrame(createControlFrame(type, payload), this.controlFrameLimits));
   }
   notifyTunnelClosed(tunnel) {
+    if (this.reportReceipt !== void 0 && tunnel.grantId !== void 0) {
+      try {
+        this.reportReceipt({
+          connectionId: tunnel.connectionId,
+          grantId: tunnel.grantId,
+          clientDeviceId: tunnel.peer.deviceId,
+          startedAt: tunnel.createdAt ?? Date.now(),
+          frames: tunnel.channel?.receivedFrames ?? 0,
+          bytes: tunnel.channel?.receivedBytes ?? 0
+        });
+      } catch {
+      }
+    }
     if (!tunnel.lease || this.socket?.readyState !== 1) return;
     try {
       this.sendControl("connection.lease.close", { connectionId: tunnel.connectionId });
@@ -110966,11 +111103,13 @@ var ServerNoiseChannel = class {
     };
     this.peerDeviceId = tunnel.peer.deviceId;
     this.peerIdentityKey = tunnel.peer.publicKey;
+    this.executionScopes = tunnel.executionScopes;
   }
   sends = new SerialSend();
   security;
   peerDeviceId;
   peerIdentityKey;
+  executionScopes;
   mode;
   createTransportUpgradeHost;
   transmitSequenced;
@@ -111105,8 +111244,13 @@ var ServerNoiseChannel = class {
     }
     if (plaintext === void 0) return;
     const message = decodeMessage(plaintext);
+    this.receivedFrames += 1;
+    this.receivedBytes += plaintext.byteLength;
     for (const handler of this.handlers) handler(message);
   }
+  /** 供会话结束回执使用的计数器（非敏感、无内容）。 */
+  receivedFrames = 0;
+  receivedBytes = 0;
   receive(counter, ciphertext, _source) {
     if (this.tunnel.lease && !this.tunnel.lease.valid()) return;
     if (this.closed) return;
@@ -111285,7 +111429,7 @@ function closeCode(code) {
 import { randomUUID as randomUUID20 } from "node:crypto";
 import { homedir as homedir10 } from "node:os";
 import { lstat as lstat7, realpath as realpath8, stat as stat11 } from "node:fs/promises";
-import { dirname as dirname10, isAbsolute as isAbsolute11, join as join19, parse as parse5, relative as relative6, resolve as resolve10, sep as sep4 } from "node:path";
+import { dirname as dirname10, isAbsolute as isAbsolute11, join as join20, parse as parse5, relative as relative6, resolve as resolve10, sep as sep4 } from "node:path";
 
 // packages/plugin/src/remote-directory-browser.ts
 import { mkdir as mkdir6, readdir as readdir6, stat as stat10 } from "node:fs/promises";
@@ -112308,7 +112452,7 @@ var HarnessRemoteBridge = class {
       const parts = rel.split(sep4).filter((p) => p.length > 0 && p !== ".");
       let currentPath = root2;
       for (let i = 0; i < parts.length - 1; i++) {
-        currentPath = join19(currentPath, parts[i]);
+        currentPath = join20(currentPath, parts[i]);
         if (isPathOutside2(relative6(root2, currentPath))) {
           throw workspaceFileFailure("WORKSPACE_PATH_DENIED", "The requested workspace path is outside the workspace.", "outside-root");
         }
@@ -113255,7 +113399,7 @@ function errorText(error62) {
 
 // packages/plugin/src/service.ts
 import { execFileSync as execFileSync4 } from "node:child_process";
-import { existsSync as existsSync5 } from "node:fs";
+import { existsSync as existsSync6 } from "node:fs";
 
 // packages/plugin/src/codex-workspace-bridge.ts
 var CodexWorkspaceBridge = class extends WorkspaceBridge {
@@ -113288,6 +113432,7 @@ var HostPluginRuntime = class {
     this.schedule = schedule;
     this.codexStartupGraceMs = codexStartupGraceMs;
     this.terminalEnabled = config2.terminal.enabled;
+    this.grantsEnabled = config2.grants?.enabled === true;
     this.loopbackPorts = [...config2.loopback.ports];
     this.codex = new CodexRemoteDomain(config2.codex, logger2);
     this.acp = new AcpRemoteGateway(
@@ -113417,7 +113562,9 @@ var HostPluginRuntime = class {
         }, resolveDshWeb) : void 0,
         resolveDshWeb && context.transportMode && context.lanWebAddress ? new DshWebLanPeer(resolveDshWeb, context.transportMode, context.lanWebAddress) : void 0,
         context.sameLinkIpv6Endpoints,
-        workspaceGit
+        workspaceGit,
+        // 鎵ц绾ц寖鍥撮殢杩炴帴涓嬪彂锛泆ndefined 琛ㄧず鏈敹绐勶紙鏃?Server / 鏃?scopes 鐨勫鎵橈級銆?
+        context.executionScopes
       );
     }, this.logger);
     if (config2.serverUrl !== void 0) {
@@ -113429,6 +113576,9 @@ var HostPluginRuntime = class {
   uploadBudget = new WorkspaceUploadBudget();
   loopbackHosts = /* @__PURE__ */ new Set();
   terminalEnabled;
+  grantsEnabled = false;
+  receiptSigner;
+  receiptKeyPublished = false;
   loopbackPorts;
   identity;
   serverApi;
@@ -113774,8 +113924,43 @@ var HostPluginRuntime = class {
       void 0,
       this.config.forceRelay ? void 0 : () => loadNodeRtcFactory({ routeTargets: this.config.serverUrl === void 0 ? [] : [this.config.serverUrl] }),
       () => this.hostCapabilities(),
-      this.harnessVersion
+      this.harnessVersion,
+      (info) => this.reportReceipt(info)
     );
+  }
+  /**
+   * 浼氳瘽缁撴潫鍥炴墽锛氶粯璁ゅ叧闂€傚紑鍚悗 Host 鐢ㄦ湰鏈虹殑 Ed25519 鍥炴墽瀵嗛挜绛惧悕骞舵彁浜わ紝
+   * Server 鍙帴鍙椾笌瀹冭嚜宸辫璇佷竴鑷寸殑浼氳瘽锛堣繛鎺?濮旀墭/瀵圭锛夛紝璁℃暟鍚勮嚜鐙珛銆?
+   */
+  reportReceipt(info) {
+    if (!this.grantsEnabled || !this.config.grants?.receiptSigning) return;
+    const api = this.serverApi;
+    const identity3 = this.identity;
+    if (api === void 0 || identity3 === void 0) return;
+    try {
+      const signer = this.receiptSigner ??= ReceiptSigner.load(this.identities.directory);
+      const receipt = {
+        connectionId: info.connectionId,
+        grantId: info.grantId,
+        clientDeviceId: info.clientDeviceId,
+        hostDeviceId: identity3.deviceId,
+        startedAt: info.startedAt,
+        endedAt: Date.now(),
+        counters: { frames: info.frames, bytes: info.bytes }
+      };
+      const signature = signer.sign(ReceiptSigner.signingInput(receipt));
+      void (async () => {
+        if (!this.receiptKeyPublished) {
+          await api.publishReceiptKey(signer.publicKey);
+          this.receiptKeyPublished = true;
+        }
+        await api.submitReceipt({ ...receipt, signer: signer.publicKey, sig: signature });
+      })().catch((error62) => {
+        this.logger.warn("receipt submission failed", { reason: diagnosticReason(error62 instanceof Error ? error62 : new Error(String(error62))) });
+      });
+    } catch (error62) {
+      this.logger.warn("receipt signing unavailable", { reason: diagnosticReason(error62 instanceof Error ? error62 : new Error(String(error62))) });
+    }
   }
   async readHarnessVersion() {
     const version2 = await readHarnessDistributionVersion();
@@ -113784,6 +113969,7 @@ var HostPluginRuntime = class {
   }
   hostCapabilities() {
     const capabilities = ["workspace.upload.v1"];
+    if (this.grantsEnabled) capabilities.push("grants.v1");
     if (this.loopbackPorts.length > 0) capabilities.push("loopback.http-ws.v1");
     if (this.localGateway?.supportsCarrier === true) {
       capabilities.push(
@@ -113877,7 +114063,7 @@ var HostPluginRuntime = class {
   acpAvailable(command) {
     if (command === "opencode") {
       try {
-        if (existsSync5("/usr/local/bin/opencode") || existsSync5("/var/lib/dsh/.opencode/bin/opencode")) return true;
+        if (existsSync6("/usr/local/bin/opencode") || existsSync6("/var/lib/dsh/.opencode/bin/opencode")) return true;
       } catch {
       }
     }
@@ -113922,7 +114108,7 @@ var HostPluginRuntime = class {
   }
 };
 function shortId4(value) {
-  return value.length <= 12 ? value : `${value.slice(0, 8)}\u2026${value.slice(-4)}`;
+  return value.length <= 12 ? value : `${value.slice(0, 8)}\u9225?{value.slice(-4)}`;
 }
 function isPlainRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -114610,7 +114796,7 @@ function decodeBase64(value) {
 // packages/plugin/src/cli.ts
 import { stat as stat12 } from "node:fs/promises";
 import { hostname as hostname5 } from "node:os";
-import { join as join20 } from "node:path";
+import { join as join21 } from "node:path";
 var QR_POLL_INTERVAL_MS = 2e3;
 var TERMINAL_QR_MARGIN = 4;
 async function runCli(args = process.argv.slice(2), dependencies = {}) {
@@ -114702,7 +114888,7 @@ async function status(args, runtime) {
     `Server: ${serverUrl}`,
     "Host control: enabled"
   ];
-  if (!await exists3(join20(directory, "device.json"))) {
+  if (!await exists3(join21(directory, "device.json"))) {
     lines.push("Device: not initialized", "Authorization: logged out", "Credential: unavailable");
     write2(runtime.stdout, `${lines.join("\n")}
 
@@ -114762,9 +114948,9 @@ async function logout(args, runtime) {
   }
   const directory = serverStorageDirectory(root2, serverUrl, "host");
   const [hasDevice, hasKey, hasCredentials] = await Promise.all([
-    exists3(join20(directory, "device.json")),
-    exists3(join20(directory, "device.key")),
-    exists3(join20(directory, "server-credentials.json"))
+    exists3(join21(directory, "device.json")),
+    exists3(join21(directory, "device.key")),
+    exists3(join21(directory, "server-credentials.json"))
   ]);
   if (!hasDevice && !hasKey && !hasCredentials) {
     await new ServerCredentialStore(directory).clear();

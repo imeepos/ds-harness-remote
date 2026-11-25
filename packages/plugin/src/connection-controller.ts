@@ -17,6 +17,8 @@ interface ActiveConnection {
 
 export interface PeerConnectionContext {
   peerIdentityKey?: string
+  /** 本连接的执行级范围；缺省表示未收窄。 */
+  executionScopes?: readonly string[]
   sameLinkIpv6Endpoints?: AuthenticatedPeerChannel['sameLinkIpv6Endpoints']
   lanWebAddress?: AuthenticatedPeerChannel['lanWebAddress']
   transportMode?: () => AuthenticatedPeerChannel['mode']
@@ -93,7 +95,7 @@ export class ConnectionController {
     await Promise.all(replaced.map(connection => this.disconnect(connection, 'CONNECTION_REPLACED')))
 
     const router = this.createRouter(
-      { connectionId, peerDeviceId: channel.peerDeviceId, peerIdentityKey: channel.peerIdentityKey, transportMode: () => channel.mode, sameLinkIpv6Endpoints: channel.sameLinkIpv6Endpoints?.bind(channel), lanWebAddress: channel.lanWebAddress?.bind(channel), createTransportUpgradeHost: channel.createTransportUpgradeHost?.bind(channel) },
+      { connectionId, peerDeviceId: channel.peerDeviceId, peerIdentityKey: channel.peerIdentityKey, executionScopes: channel.executionScopes, transportMode: () => channel.mode, sameLinkIpv6Endpoints: channel.sameLinkIpv6Endpoints?.bind(channel), lanWebAddress: channel.lanWebAddress?.bind(channel), createTransportUpgradeHost: channel.createTransportUpgradeHost?.bind(channel) },
       message => this.sendTo(connectionId, channel, message),
     )
     const connection: ActiveConnection = {

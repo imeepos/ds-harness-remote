@@ -81,6 +81,12 @@ interface PendingTunnel {
   connectionId: string
   membershipId: string
   peer: TrustedPeer
+  /** 本连接的执行级范围；undefined 表示未收窄。 */
+  executionScopes?: readonly string[]
+  /** 覆盖本连接的委托 id（用于会话结束回执）。 */
+  grantId?: string
+  /** 隧道建立时刻（回执的 startedAt）。 */
+  createdAt?: number
   preferredTransports: ConnectIncomingPayload['preferredTransports']
   noise: NoiseIkSession
   transport: 'negotiating' | SelectedTransport
@@ -139,6 +145,8 @@ export class HostServerConnection {
     private readonly rtcFactoryProvider?: () => Promise<RtcPeerConnectionFactory | undefined>,
     private readonly hostCapabilities: () => readonly string[] = () => [],
     private readonly harnessVersion?: string,
+    /** 会话结束回执上报（opt-in）。 */
+    private readonly reportReceipt?: (info: { connectionId: string; grantId: string; clientDeviceId: string; startedAt: number; frames: number; bytes: number }) => void,
   ) {}
 
   start(): void {
@@ -743,12 +751,22 @@ export class HostServerConnection {
       remotePublicKey: peer.publicKey,
       prologue: createNoisePrologue(payload.connectionId, this.identity.deviceId, peer.deviceId),
     })
+    // 执行级范围：只有当覆盖这条关系的每一份委托都带了 executionScopes 时才收窄。
+    // 任何一份委托没有 scopes（例如旧版 Server 生成的、或隐式全通）都视为"未收窄"。
+    const coveringGrants = descriptor.grants ?? []
+    const scopedGrants = coveringGrants.filter(grant => grant.executionScopes !== undefined)
+    const executionScopes = coveringGrants.length > 0 && scopedGrants.length === coveringGrants.length
+      ? [...new Set(scopedGrants.flatMap(grant => grant.executionScopes ?? []))]
+      : undefined
     const tunnel: PendingTunnel = {
       recoveryTicket: this.negotiatedCapabilities.includes(WEBRTC_RESUME_CAPABILITY) ? payload.recoveryTicket : undefined,
       relayRecoveryTicket: this.negotiatedCapabilities.includes(RELAY_RESUME_CAPABILITY) ? payload.relayRecoveryTicket : undefined,
       connectionId: payload.connectionId,
       membershipId: descriptor.membershipId,
       peer,
+      createdAt: Date.now(),
+      ...(coveringGrants[0] === undefined ? {} : { grantId: coveringGrants[0].id }),
+      ...(executionScopes === undefined ? {} : { executionScopes }),
       preferredTransports: payload.preferredTransports,
       noise,
       transport: 'negotiating',
@@ -1466,6 +1484,21 @@ export class HostServerConnection {
   }
 
   private notifyTunnelClosed(tunnel: PendingTunnel): void {
+    // 回执先于 lease 判断：没有控制租约的普通会话同样要留回执。
+    if (this.reportReceipt !== undefined && tunnel.grantId !== undefined) {
+      try {
+        this.reportReceipt({
+          connectionId: tunnel.connectionId,
+          grantId: tunnel.grantId,
+          clientDeviceId: tunnel.peer.deviceId,
+          startedAt: tunnel.createdAt ?? Date.now(),
+          frames: tunnel.channel?.receivedFrames ?? 0,
+          bytes: tunnel.channel?.receivedBytes ?? 0,
+        })
+      } catch {
+        // 回执失败不得影响连接清理。
+      }
+    }
     if (!tunnel.lease || this.socket?.readyState !== 1) return
     try { this.sendControl('connection.lease.close', { connectionId: tunnel.connectionId }) } catch { /* local cleanup proceeds */ }
   }
@@ -1565,6 +1598,7 @@ export class ServerNoiseChannel implements AuthenticatedPeerChannel {
   readonly security
   readonly peerDeviceId: string
   readonly peerIdentityKey: string
+  readonly executionScopes?: readonly string[]
   mode: 'LAN' | 'P2P' | 'TURN' | 'Relay'
   readonly createTransportUpgradeHost?: AuthenticatedPeerChannel['createTransportUpgradeHost']
   private transmitSequenced?: (counter: number, ciphertext: Uint8Array) => Promise<void>
@@ -1599,6 +1633,7 @@ export class ServerNoiseChannel implements AuthenticatedPeerChannel {
     }
     this.peerDeviceId = tunnel.peer.deviceId
     this.peerIdentityKey = tunnel.peer.publicKey
+    this.executionScopes = tunnel.executionScopes
   }
 
   async sameLinkIpv6Endpoints(pair?: SameLinkIpv6Pair): Promise<string[]> {
@@ -1753,8 +1788,15 @@ export class ServerNoiseChannel implements AuthenticatedPeerChannel {
     }
     if (plaintext === undefined) return
     const message = decodeMessage(plaintext)
+    // 回执计数：只数本通道收到并解密的业务消息与明文字节。
+    this.receivedFrames += 1
+    this.receivedBytes += plaintext.byteLength
     for (const handler of this.handlers) handler(message)
   }
+
+  /** 供会话结束回执使用的计数器（非敏感、无内容）。 */
+  receivedFrames = 0
+  receivedBytes = 0
 
   receive(counter: number | undefined, ciphertext: Uint8Array, _source?: RtcDataChannelTransport): void {
     if (this.tunnel.lease && !this.tunnel.lease.valid()) return

@@ -84,6 +84,7 @@ export interface ResolvedConfig {
     jitter: number
   }
   terminal: { enabled: boolean }
+  grants: { enabled: boolean; receiptSigning: boolean }
   remoteTools?: { enabled: boolean }
   sidebar: { entry: 'standard' | 'compact' }
   hostControl?: { enabled: boolean }
@@ -114,6 +115,7 @@ export const entryConfigSchema = s.object({
   httpServerAllowlist: s.array(s.string()),
   deviceName: s.string(),
   terminal: s.object({ enabled: s.boolean() }),
+  grants: s.object({ enabled: s.boolean(), receiptSigning: s.boolean() }),
   remoteTools: s.object({ enabled: s.boolean() }),
   sidebar: s.object({ entry: s.union(['standard', 'compact'] as const) }),
   hostControl: s.object({ enabled: s.boolean() }),
@@ -171,6 +173,8 @@ const configSchema = z.object({
   httpServerAllowlist: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
   deviceName: z.string().trim().min(1).max(80).optional(),
   terminal: z.object({ enabled: z.boolean().optional() }).strict().optional(),
+  /** 执行级收窄（grants.v1）：默认关闭，开启后 Host 才会宣告并消费委托。 */
+  grants: z.object({ enabled: z.boolean().optional(), receiptSigning: z.boolean().optional() }).strict().optional(),
   remoteTools: z.object({ enabled: z.boolean().optional() }).strict().optional(),
   sidebar: z.object({ entry: z.enum(['standard', 'compact']).optional() }).strict().optional(),
   hostControl: z.object({ enabled: z.boolean().optional() }).strict().optional(),
@@ -202,6 +206,8 @@ export function resolveConfig(input: ConfigInput = {}, env: NodeJS.ProcessEnv = 
   const codexEnabled = codexBackend?.enabled ?? parsed.codex?.enabled ?? true
   const acpEnabled = parsed.acp?.enabled ?? true
   const reconnect = typeof parsed.reconnect === 'object' ? parsed.reconnect : {}
+  // 单一显式开关：打开 grants.enabled 即同时启用回执签名；要单独关掉签名可显式写 false。
+  const grantsEnabled = parsed.grants?.enabled ?? env.DSH_REMOTE_GRANTS_ENABLED === 'true'
   const configuredServerUrl = parsed.serverUrl ?? env.DSH_REMOTE_SERVER
   const httpServerAllowlist = normalizeHttpServerAllowlist(
     parsed.httpServerAllowlist ?? parseHttpServerAllowlistEnv(env.DSH_REMOTE_HTTP_SERVER_ALLOWLIST),
@@ -220,6 +226,10 @@ export function resolveConfig(input: ConfigInput = {}, env: NodeJS.ProcessEnv = 
     deviceName: parsed.deviceName ?? env.DSH_REMOTE_DEVICE_NAME ?? hostname(),
     hostControl: { enabled: parsed.hostControl?.enabled ?? true },
     terminal: { enabled: parsed.terminal?.enabled ?? (env.DSH_REMOTE_TERMINAL_ENABLED === undefined || env.DSH_REMOTE_TERMINAL_ENABLED === 'true') },
+    grants: {
+      enabled: grantsEnabled,
+      receiptSigning: parsed.grants?.receiptSigning ?? grantsEnabled,
+    },
     remoteTools: { enabled: parsed.remoteTools?.enabled ?? true },
     sidebar: { entry: parsed.sidebar?.entry === 'compact' ? 'compact' : 'standard' },
     loopback: { ports: [...new Set(parsed.loopback?.ports ?? [])] },
